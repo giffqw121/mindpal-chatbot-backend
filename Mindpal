@@ -1,0 +1,215 @@
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+import requests
+import json
+import logging
+from typing import Dict, Optional
+
+# Initialize FastAPI app
+app = FastAPI(title="Mindpal Chatbot Integration")
+
+# Configure CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Mindpal API configuration (replace with your actual values)
+MIND_PAL_API_URL = "https://api.mindpal.io/v1/chat"
+MIND_PAL_API_KEY = "your_mindpal_api_key_here"
+BUDGETING_MODULE_ID = "your_budgeting_module_id_here"
+
+# Models
+class UserMessage(BaseModel):
+    user_id: str
+    message: str
+    module_id: Optional[str] = BUDGETING_MODULE_ID  # Default to budgeting module
+    context: Optional[Dict] = None  # For maintaining conversation state
+
+class MindpalResponse(BaseModel):
+    response: Dict
+    context: Optional[Dict] = None
+    message_type: Optional[str] = None  # e.g., "flashcard", "quiz", "explanation"
+
+# Helper function to call Mindpal API
+async def call_mindpal_api(payload: Dict) -> Dict:
+    headers = {
+        "Authorization": f"Bearer {MIND_PAL_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    
+    try:
+        response = requests.post(
+            MIND_PAL_API_URL,
+            headers=headers,
+            json=payload,
+            timeout=30
+        )
+        response.raise_for_status()
+        return response.json()
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Mindpal API call failed: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to communicate with Mindpal API")
+
+# API Endpoint to handle chatbot interaction
+@app.post("/chat", response_model=MindpalResponse)
+async def handle_chat(user_message: UserMessage):
+    """
+    Handles conversation with the Mindpal chatbot for the budgeting module.
+    
+    Flow:
+    1. Receives user message
+    2. Calls Mindpal API with proper context
+    3. Processes response (flashcards, quiz, etc.)
+    4. Returns structured response to frontend
+    """
+    # Prepare payload for Mindpal API
+    payload = {
+        "user_id": user_message.user_id,
+        "message": user_message.message,
+        "module_id": user_message.module_id,
+        "context": user_message.context or {}
+    }
+    
+    # Call Mindpal API
+    try:
+        mindpal_response = await call_mindpal_api(payload)
+        
+        # Process the response based on your requirements
+        processed_response = process_mindpal_response(mindpal_response)
+        
+        return processed_response
+    except Exception as e:
+        logger.error(f"Error processing chat: {str(e)}")
+        raise HTTPException(status_code=500, detail="Error processing chat request")
+
+def process_mindpal_response(raw_response: Dict) -> MindpalResponse:
+    """
+    Processes the raw response from Mindpal API to extract:
+    - Different message types (flashcards, quiz, etc.)
+    - Maintains conversation context
+    - Structures the response for frontend
+    """
+    # Initialize response
+    response = MindpalResponse(response=raw_response)
+    
+    # Extract message type if tagged
+    if "metadata" in raw_response and "type" in raw_response["metadata"]:
+        response.message_type = raw_response["metadata"]["type"]
+        
+        # Handle different message types
+        if response.message_type == "flashcard":
+            # Process flashcard content
+            response.response = {
+                "type": "flashcard",
+                "content": raw_response.get("content", {})
+            }
+        elif response.message_type == "quiz":
+            # Process quiz content
+            response.response = {
+                "type": "quiz",
+                "questions": raw_response.get("questions", []),
+                "options": raw_response.get("options", {})
+            }
+        elif response.message_type == "explanation":
+            # Process mindmap explanation
+            response.response = {
+                "type": "explanation",
+                "content": raw_response.get("content", ""),
+                "mindmap": raw_response.get("mindmap", {})
+            }
+    
+    # Maintain context for conversation
+    if "context" in raw_response:
+        response.context = raw_response["context"]
+    
+    return response
+
+# Endpoint to handle quiz submission and reward triggering
+@app.post("/submit-quiz")
+async def submit_quiz_results(quiz_data: Dict):
+    """
+    Handles quiz submission and triggers rewards based on score.
+    Expected quiz_data format:
+    {
+        "user_id": "123",
+        "module_id": "budgeting",
+        "answers": {"q1": "a", "q2": "b", ...},
+        "context": {}  # conversation context
+    }
+    """
+    # Prepare payload for Mindpal to evaluate quiz
+    payload = {
+        "user_id": quiz_data["user_id"],
+        "module_id": quiz_data["module_id"],
+        "action": "evaluate_quiz",
+        "quiz_data": quiz_data["answers"],
+        "context": quiz_data.get("context", {})
+    }
+    
+    try:
+        # Call Mindpal API to evaluate quiz
+        evaluation = await call_mindpal_api(payload)
+        
+        # Process the evaluation to determine rewards
+        score = evaluation.get("score", 0)
+        max_score = evaluation.get("max_score", 5)
+        
+        # Determine reward based on score (customize as needed)
+        reward = None
+        if score >= max_score * 0.8:  # 80% or higher
+            reward = {"type": "gold", "points": 50}
+        elif score >= max_score * 0.6:  # 60% or higher
+            reward = {"type": "silver", "points": 30}
+        else:
+            reward = {"type": "bronze", "points": 10}
+        
+        return {
+            "score": score,
+            "max_score": max_score,
+            "feedback": evaluation.get("feedback", ""),
+            "reward": reward,
+            "next_steps": evaluation.get("next_steps", "")
+        }
+    except Exception as e:
+        logger.error(f"Error evaluating quiz: {str(e)}")
+        raise HTTPException(status_code=500, detail="Error evaluating quiz")
+
+# Endpoint to update course materials
+@app.post("/update-materials")
+async def update_course_materials(materials: Dict):
+    """
+    Updates course materials in Mindpal.
+    Expected format:
+    {
+        "module_id": "budgeting",
+        "materials": [
+            {"type": "pdf", "url": "..."},
+            {"type": "doc", "url": "..."}
+        ]
+    }
+    """
+    payload = {
+        "action": "update_materials",
+        "module_id": materials["module_id"],
+        "materials": materials["materials"]
+    }
+    
+    try:
+        response = await call_mindpal_api(payload)
+        return {"status": "success", "details": response}
+    except Exception as e:
+        logger.error(f"Error updating materials: {str(e)}")
+        raise HTTPException(status_code=500, detail="Error updating course materials")
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
